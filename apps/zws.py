@@ -1,6 +1,7 @@
 import socket,os
 import threading
 from typing import Callable, Literal
+import json
 
 MatchStrategy = Literal["exact", "startswith", "endswith", "contains"]
 
@@ -28,12 +29,13 @@ class Route:
     def call(self,*args, **kwargs):
         return self.function(*args, **kwargs)
 
-def response(status:str = "200 OK", content:str = "", content_type:str = ""):
+def response(status:str = "200 OK", content:str = "", content_type:str = "", nosniff=False):
     '''Build a response'''
+    sniff = "X-Content-Type-Options: nosniff\r\n" if nosniff else ""
     if content != "" and content_type != "":
-        end = f"Content-Type: {content_type}\r\n\r\n{content}\n"
+        end = f"{sniff}Content-Type: {content_type}\r\n\r\n{content}\n"
     elif content != "":
-        end = f"Content-Type: text/plain\r\n\r\n{content}\n"
+        end = f"{sniff}Content-Type: text/plain\r\n\r\n{content}\n"
     else:
         end = ""
     return f"HTTP/1.1 {status}\r\n{end}".encode()
@@ -86,6 +88,10 @@ class Server():
                             case "md": content_type = "text/markdown"
                             case "css": content_type = "text/css"
                             case "js": content_type = "text/javascript"
+                            case "gif": content_type = "image/gif"
+                            case "jpeg" | "jpg": content_type = "image/png"
+                            case "svg": content_type = "image/svg+xml"
+                            case "webp": content_type = "webp"
                         connection.send(response(content_type = content_type, content = open("."+data["path"],'r').read()))
                         found = True
                 except Exception as e:
@@ -124,11 +130,71 @@ class Server():
     def parse_body(self, buffer: bytes, content_type: str):
         body = {}
 
+        content_parameters = content_type.split(";")[1:] if len(content_type.split(";")) > 1 else None
+        if content_parameters != None:
+            tmp = {}
+            for i in content_parameters:
+                tmp[rls(i.split("=")[0])] = rls("=".join(i.split("=")[1:]))
+            content_parameters = tmp
+        
+        content_type = content_type.split(";")[0]
+
+
         match content_type:
             case "application/x-www-form-urlencoded":
                 for i in buffer.decode().split("&"):
                     key = i.split("=")[0]
                     value = "=".join(i.split("=")[1:])
                     body[key] = value
+            case "application/json":
+                try:
+                    body = json.loads(buffer.decode())
+                except Exception as e:
+                    print("Error parsing request json: "+e)
+            case "multipart/form-data":
+                boundary = content_parameters["boundary"]
+
+                parts = buffer.decode().split("--" + boundary)
+                form_data = {}
+
+                for part in parts:
+                    part = part.strip()
+                    if not part or part == "--":
+                        continue
+
+                    headers, _, part_body = part.partition("\r\n\r\n")
+                    header_lines = headers.split("\r\n")
+
+                    content_disposition = None
+                    for line in header_lines:
+                        if line.lower().startswith("content-disposition:"):
+                            content_disposition = line
+                            break
+
+                    if not content_disposition:
+                        continue
+
+                    disposition_parts = content_disposition.split(";")
+                    disposition_dict = {}
+                    for item in disposition_parts[1:]:
+                        if "=" in item:
+                            key, value = item.strip().split("=", 1)
+                            disposition_dict[key] = value.strip('"')
+
+                    name = disposition_dict.get("name")
+                    filename = disposition_dict.get("filename")
+
+                    if name:
+                        if filename:
+                            form_data[name] = {
+                                "filename": filename,
+                                "content": part_body.rstrip("\r\n")
+                            }
+                        else:
+                            form_data[name] = part_body.rstrip("\r\n")
+                    body["form"] = form_data
+            case _:
+                print("Unknown content type:",content_type)
+                print("buffer:",buffer.decode())
 
         return body
